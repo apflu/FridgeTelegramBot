@@ -1,0 +1,13 @@
+[project]
+name = "fridge-telegram-bot"
+version = "0.1.0"
+description = "Telegram bot for fridge food expiration tracking with LLM-powered natural language input"
+requires-python = ">=3.12"
+dependencies = [
+    "google-genai",
+    "pydantic>=2",
+    "python-dotenv",
+    "python-telegram-bot[job-queue]>=21",
+    "aiosqlite",
+    "loguru",
+]

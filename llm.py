@@ -1,0 +1,144 @@
+import asyncio
+import os
+import re
+from datetime import date
+from typing import Literal
+
+from google import genai
+from google.genai import errors, types
+from loguru import logger
+from pydantic import BaseModel, Field
+
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+RETRYABLE_CODES = {429, 500, 502, 503, 504}
+
+
+class Operation(BaseModel):
+    intent: Literal["add", "consume", "update"]
+    item: str
+    original_name: str | None = None
+    entry_date: str | None = None
+    expiry_date: str | None = None
+
+
+class ParsedInput(BaseModel):
+    kind: Literal["operations", "query", "unknown"]
+    operations: list[Operation] = []
+    confidence: float = Field(ge=0, le=1)
+    reasoning: str
+
+
+SYSTEM_PROMPT = """你是一个家用冰箱食材管理助手，解析用户的中文自然语言输入。
+
+一条消息可能包含多项操作，你需要全部抽取出来。
+
+消息类型 (kind)：
+- operations: 用户在对冰箱进行增/删/改（可包含多项）
+- query: 用户在查询冰箱内容
+- unknown: 无法判断 → 低置信度
+
+每个 operation 字段：
+- intent:
+  - add: 新增食材
+  - consume: 吃掉 / 扔掉 / 已过期 → 从列表移除
+  - update: 修改已有食材的名称或日期
+- item: **中文**食材名称（单个，多个食材拆成多个 operation）
+  - 规则见下方「命名规则」
+- original_name: 可选，仅当 item 是从外文翻译而来时，填原文；否则 null
+- entry_date（入库日期，YYYY-MM-DD）：
+  - "今天买了" → 今天
+  - "昨天买的" → 昨天
+  - add 意图未提及 → 今天
+  - consume / update 留 null
+- expiry_date（过期日期，YYYY-MM-DD）：
+  - 用户明说日期 → 按用户说的
+  - "还能放 N 天" → 今天 + N
+  - add 未提及 → 按「冷藏、未开封、家庭环境」给保守估计
+  - consume 留 null
+
+命名规则（决定 item 和 original_name）：
+- 用户输入**全中文**（含"光明牛奶"这种中文品牌）→ item=用户原话，original_name=null
+- 用户输入**纯外文**（如"Hänchen Oberschenkel"、"Yogurt"）→ item=中文翻译，original_name=原文
+- 用户输入**中外混合**（如"Lay's 薯片"、"Haagen-Dazs 冰淇淋"）→ 由你判断：
+  - 中文部分已能识别品类（"Lay's **薯片**"）→ item=原样保留，original_name=null
+  - 中文部分不足以识别（如仅品牌名"Haagen-Dazs"无中文品类）→ item=中文品类（"冰淇淋"），original_name=原文
+
+「冰箱现有」匹配规则（仅 consume / update）：
+- 列表格式：单纯"A"表示 name=A 且无原文；"A (B)"表示 name=A、original_name=B
+- 即使用户说的与列表中写法不同（中文别名 / 简称 / 使用原文名），只要语义明确对应某一项，**item 填列表中的 name 部分**；若该项带原文，同时输出 original_name=原文
+- 示例：
+  - 列表 ["鸡腿 (Hänchen Oberschenkel)"]，用户："Hänchen 吃完了" → item="鸡腿", original_name="Hänchen Oberschenkel"
+  - 列表 ["鸡腿 (Hänchen Oberschenkel)"]，用户："鸡腿吃完了" → item="鸡腿", original_name="Hänchen Oberschenkel"
+  - 列表 ["老酸奶"]，用户："酸奶扔了" → item="老酸奶", original_name=null
+- 列表中找不到语义对应项：item 按「命名规则」处理，reasoning 注明"冰箱中无此项"，confidence 降到 ≤ 0.6
+
+多项操作示例：
+- "今天买了生菜和一盒鸡蛋" → 2 个 add
+- "牛奶喝完了，酸奶还能放 2 天" → 1 consume + 1 update
+- "酸奶和生菜都扔了" → 2 consume
+- "冰箱里还有啥" → kind=query, operations 为空
+- "今天天气真好" → kind=unknown, operations 为空
+
+confidence（整条消息整体置信度）：
+- >= 0.9: 意图和字段都明确
+- 0.7–0.9: 基本确定但有模糊
+- < 0.7: 模棱两可，应让用户重说
+
+reasoning: 简短说明判断依据，尤其保质期估计如何得出。"""
+
+
+def _build_user_prompt(today: date, user_input: str, existing_items: list[str] | None) -> str:
+    lines = [f"今天：{today.isoformat()}"]
+    if existing_items:
+        lines.append(f"冰箱现有：{', '.join(existing_items)}")
+    lines.append(f'用户输入："{user_input}"')
+    return "\n".join(lines)
+
+
+async def parse_input(
+    user_input: str,
+    today: date | None = None,
+    existing_items: list[str] | None = None,
+) -> ParsedInput:
+    today = today or date.today()
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    user_prompt = _build_user_prompt(today, user_input, existing_items)
+
+    response = await client.aio.models.generate_content(
+        model=MODEL,
+        contents=user_prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_schema=ParsedInput,
+            temperature=0.1,
+        ),
+    )
+    return response.parsed
+
+
+def _extract_retry_delay(exc: Exception, default: float) -> float:
+    m = re.search(r"['\"]retryDelay['\"]:\s*['\"](\d+(?:\.\d+)?)s['\"]", str(exc))
+    return float(m.group(1)) if m else default
+
+
+async def parse_with_retry(
+    user_input: str,
+    today: date | None = None,
+    existing_items: list[str] | None = None,
+    max_attempts: int = 5,
+    base_delay: float = 2.0,
+) -> ParsedInput:
+    delay = base_delay
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await parse_input(user_input, today, existing_items)
+        except (errors.ClientError, errors.ServerError) as e:
+            code = getattr(e, "code", None)
+            if code not in RETRYABLE_CODES or attempt == max_attempts:
+                raise
+            wait = _extract_retry_delay(e, default=delay)
+            logger.warning(f"gemini {code}, retry in {wait:.1f}s (attempt {attempt}/{max_attempts})")
+            await asyncio.sleep(wait)
+            delay = min(delay * 2, 60)
+    raise RuntimeError("unreachable")
