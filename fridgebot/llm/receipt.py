@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from .parser import MODEL, complete, run_with_retry
+from .parser import MODEL, complete, run_with_retry, system_content
 
 # 视觉模型：默认回退到文字模型（当前两者都是 gemini-2.5-flash，皆多模态）。
 VISION_MODEL = os.getenv("OPENAI_VISION_MODEL") or MODEL
@@ -27,7 +27,7 @@ class ParsedReceipt(BaseModel):
     reasoning: str
 
 
-RECEIPT_SYSTEM_PROMPT = """你是一个家用冰箱食材管理助手，从一张超市收据照片中抽取**需要烹饪的生鲜和速冻食品**。
+RECEIPT_SYSTEM_PROMPT_RULES = """你是一个家用冰箱食材管理助手，从一张超市收据照片中抽取**需要烹饪的生鲜和速冻食品**。
 
 只保留这两类，其余一律丢弃（不要出现在 lines 中）：
 - fresh（生鲜）：蔬菜、水果、肉、鱼、蛋、奶/酸奶、豆腐等需冷藏或当季食用的食材
@@ -53,7 +53,10 @@ confidence（整张收据识别的整体置信度，0–1）：识别清晰且�
 
 reasoning：简短说明，尤其哪些项被丢弃。
 
-输出格式：只返回一个 JSON 对象，不要任何额外文字或 markdown 代码块。结构：
+没有任何生鲜/速冻项时 lines 为空数组 []。"""
+
+
+RECEIPT_JSON_FORMAT = """输出格式：只返回一个 JSON 对象，不要任何额外文字或 markdown 代码块。结构：
 {
   "lines": [
     {
@@ -67,8 +70,7 @@ reasoning：简短说明，尤其哪些项被丢弃。
   "currency": "EUR",
   "confidence": 0~1 的数字,
   "reasoning": "字符串"
-}
-没有任何生鲜/速冻项时 lines 为空数组 []。"""
+}"""
 
 
 async def parse_receipt(image_bytes: bytes, today: date | None = None) -> ParsedReceipt:
@@ -77,7 +79,7 @@ async def parse_receipt(image_bytes: bytes, today: date | None = None) -> Parsed
     data_url = f"data:image/jpeg;base64,{b64}"
 
     messages = [
-        {"role": "system", "content": RECEIPT_SYSTEM_PROMPT},
+        {"role": "system", "content": system_content(RECEIPT_SYSTEM_PROMPT_RULES, RECEIPT_JSON_FORMAT)},
         {
             "role": "user",
             "content": [

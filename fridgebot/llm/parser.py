@@ -31,7 +31,7 @@ class ParsedInput(BaseModel):
     reasoning: str
 
 
-SYSTEM_PROMPT = """你是一个家用冰箱食材管理助手，解析用户的中文自然语言输入。
+SYSTEM_PROMPT_RULES = """你是一个家用冰箱食材管理助手，解析用户的中文自然语言输入。
 
 一条消息可能包含多项操作，你需要全部抽取出来。
 
@@ -94,7 +94,10 @@ confidence（整条消息整体置信度）：
 
 reasoning: 简短说明判断依据，尤其保质期估计如何得出。
 
-输出格式：只返回一个 JSON 对象，不要包含任何额外文字、解释或 markdown 代码块。结构如下：
+query / unknown 时 operations 为空数组 []。"""
+
+
+JSON_FORMAT = """输出格式：只返回一个 JSON 对象，不要包含任何额外文字、解释或 markdown 代码块。结构如下：
 {
   "kind": "operations" | "query" | "unknown",
   "confidence": 0~1 之间的数字,
@@ -108,8 +111,7 @@ reasoning: 简短说明判断依据，尤其保质期估计如何得出。
       "expiry_date": "YYYY-MM-DD" 或 null
     }
   ]
-}
-query / unknown 时 operations 为空数组 []。"""
+}"""
 
 
 def _build_user_prompt(today: date, user_input: str, existing_items: list[str] | None) -> str:
@@ -128,6 +130,12 @@ def _client() -> openai.AsyncOpenAI:
 # 置 LLM_STRUCTURED_OUTPUT=true 切换为 json_schema 约束解码（更强格式保证，需端点支持）。
 # 两套实现都保留在 complete() 里，靠环境变量切换，回退无需改代码。
 STRUCTURED_OUTPUT = os.getenv("LLM_STRUCTURED_OUTPUT", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def system_content(rules: str, json_format: str) -> str:
+    """组装 system 提示：structured 模式只发规则段；json_object 模式追加 JSON 格式说明。
+    避免在 structured 模式下与 response_format 重复描述形状，省冗余 token。"""
+    return rules if STRUCTURED_OUTPUT else f"{rules}\n\n{json_format}"
 
 
 async def complete(messages: list, schema: type[M], model: str | None = None) -> M:
@@ -162,7 +170,7 @@ async def parse_input(
     today = today or date.today()
     user_prompt = _build_user_prompt(today, user_input, existing_items)
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_content(SYSTEM_PROMPT_RULES, JSON_FORMAT)},
         {"role": "user", "content": user_prompt},
     ]
     return await complete(messages, ParsedInput)

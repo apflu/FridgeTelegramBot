@@ -2,7 +2,7 @@ from datetime import date
 
 from pydantic import BaseModel
 
-from .parser import complete, run_with_retry
+from .parser import complete, run_with_retry, system_content
 
 
 class ExpiryGuess(BaseModel):
@@ -14,7 +14,7 @@ class ExpiryGuesses(BaseModel):
     guesses: list[ExpiryGuess] = []
 
 
-ESTIMATE_SYSTEM_PROMPT = """你是一个家用冰箱食材保质期估算助手。
+ESTIMATE_SYSTEM_PROMPT_RULES = """你是一个家用冰箱食材保质期估算助手。
 给定若干食材（含名称和入库日期），为每一项估算一个合理的过期日期。
 
 估算规则（按「冷藏 / 冷冻、未开封、家庭环境」保守估计，从该项的入库日期算起）：
@@ -23,13 +23,15 @@ ESTIMATE_SYSTEM_PROMPT = """你是一个家用冰箱食材保质期估算助手�
 - 速冻食品 30–90 天
 - 不确定时偏保守（取较短）
 
-输出格式：只返回一个 JSON 对象，不要任何额外文字或 markdown：
+index 必须与输入列表的编号一一对应，且每一项都要给出。"""
+
+
+ESTIMATE_JSON_FORMAT = """输出格式：只返回一个 JSON 对象，不要任何额外文字或 markdown：
 {
   "guesses": [
     {"index": 整数, "expiry_date": "YYYY-MM-DD"}
   ]
-}
-index 必须与输入列表的编号一一对应，且每一项都要给出。"""
+}"""
 
 
 # entries: list[(name, original_name, entry_date)]
@@ -48,7 +50,7 @@ async def estimate_expiry(entries: list[Entry], today: date | None = None) -> Ex
     today = today or date.today()
     prompt = _build_prompt(entries, today)
     messages = [
-        {"role": "system", "content": ESTIMATE_SYSTEM_PROMPT},
+        {"role": "system", "content": system_content(ESTIMATE_SYSTEM_PROMPT_RULES, ESTIMATE_JSON_FORMAT)},
         {"role": "user", "content": prompt},
     ]
     return await complete(messages, ExpiryGuesses)
