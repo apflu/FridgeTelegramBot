@@ -1,4 +1,5 @@
 import asyncio
+import os
 from datetime import date
 
 from dotenv import load_dotenv
@@ -10,7 +11,9 @@ logconfig.setup()
 
 from llm import parse_with_retry
 
-SLEEP_BETWEEN = 13
+# 两次调用间隔（秒），按 provider 限速调整。
+# Gemini 免费 gemini-2.5-flash 约 10 RPM → 6s 足够；付费 OpenAI 兼容端点可设 0。
+SLEEP_BETWEEN = float(os.getenv("TEST_SLEEP_BETWEEN", "6"))
 TODAY = date(2026, 4, 24)
 
 SAMPLES: list[tuple[str, list[str] | None]] = [

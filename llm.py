@@ -1,15 +1,15 @@
 import asyncio
 import os
-import re
 from datetime import date
 from typing import Literal
 
-from google import genai
-from google.genai import errors, types
+import openai
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# 自定义 API 入口地址（任意 OpenAI 兼容端点）。留空则用官方 OpenAI 地址。
+BASE_URL = os.getenv("OPENAI_BASE_URL") or None
 RETRYABLE_CODES = {429, 500, 502, 503, 504}
 
 
@@ -84,7 +84,24 @@ confidence（整条消息整体置信度）：
 - 0.7–0.9: 基本确定但有模糊
 - < 0.7: 模棱两可，应让用户重说
 
-reasoning: 简短说明判断依据，尤其保质期估计如何得出。"""
+reasoning: 简短说明判断依据，尤其保质期估计如何得出。
+
+输出格式：只返回一个 JSON 对象，不要包含任何额外文字、解释或 markdown 代码块。结构如下：
+{
+  "kind": "operations" | "query" | "unknown",
+  "confidence": 0~1 之间的数字,
+  "reasoning": "字符串",
+  "operations": [
+    {
+      "intent": "add" | "consume" | "update",
+      "item": "字符串",
+      "original_name": 字符串或 null,
+      "entry_date": "YYYY-MM-DD" 或 null,
+      "expiry_date": "YYYY-MM-DD" 或 null
+    }
+  ]
+}
+query / unknown 时 operations 为空数组 []。"""
 
 
 def _build_user_prompt(today: date, user_input: str, existing_items: list[str] | None) -> str:
@@ -95,31 +112,37 @@ def _build_user_prompt(today: date, user_input: str, existing_items: list[str] |
     return "\n".join(lines)
 
 
+def _client() -> openai.AsyncOpenAI:
+    return openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], base_url=BASE_URL)
+
+
 async def parse_input(
     user_input: str,
     today: date | None = None,
     existing_items: list[str] | None = None,
 ) -> ParsedInput:
     today = today or date.today()
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
     user_prompt = _build_user_prompt(today, user_input, existing_items)
 
-    response = await client.aio.models.generate_content(
+    response = await _client().chat.completions.create(
         model=MODEL,
-        contents=user_prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            response_mime_type="application/json",
-            response_schema=ParsedInput,
-            temperature=0.1,
-        ),
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.1,
     )
-    return response.parsed
+    content = response.choices[0].message.content or ""
+    return ParsedInput.model_validate_json(content)
 
 
-def _extract_retry_delay(exc: Exception, default: float) -> float:
-    m = re.search(r"['\"]retryDelay['\"]:\s*['\"](\d+(?:\.\d+)?)s['\"]", str(exc))
-    return float(m.group(1)) if m else default
+def _retry_after(exc: openai.APIStatusError, default: float) -> float:
+    header = exc.response.headers.get("retry-after")
+    try:
+        return float(header) if header else default
+    except (TypeError, ValueError):
+        return default
 
 
 async def parse_with_retry(
@@ -131,14 +154,20 @@ async def parse_with_retry(
 ) -> ParsedInput:
     delay = base_delay
     for attempt in range(1, max_attempts + 1):
+        last = attempt == max_attempts
         try:
             return await parse_input(user_input, today, existing_items)
-        except (errors.ClientError, errors.ServerError) as e:
-            code = getattr(e, "code", None)
-            if code not in RETRYABLE_CODES or attempt == max_attempts:
+        except openai.APIStatusError as e:
+            if e.status_code not in RETRYABLE_CODES or last:
                 raise
-            wait = _extract_retry_delay(e, default=delay)
-            logger.warning(f"gemini {code}, retry in {wait:.1f}s (attempt {attempt}/{max_attempts})")
+            wait = _retry_after(e, default=delay)
+            logger.warning(f"llm {e.status_code}, retry in {wait:.1f}s (attempt {attempt}/{max_attempts})")
             await asyncio.sleep(wait)
+            delay = min(delay * 2, 60)
+        except (openai.APIConnectionError, ValidationError) as e:
+            if last:
+                raise
+            logger.warning(f"llm {type(e).__name__}, retry in {delay:.1f}s (attempt {attempt}/{max_attempts})")
+            await asyncio.sleep(delay)
             delay = min(delay * 2, 60)
     raise RuntimeError("unreachable")

@@ -49,10 +49,10 @@ class ParseQueue:
                     if elapsed < self._min_interval:
                         await asyncio.sleep(self._min_interval - elapsed)
                 self._last_call = loop.time()
-                logger.info(f"→ gemini: {user_input!r}")
+                logger.info(f"→ llm: {user_input!r}")
                 result = await parse_with_retry(user_input, today, existing_items)
                 ops = [f"{o.intent} {o.item}" for o in result.operations]
-                logger.info(f"← gemini: kind={result.kind} conf={result.confidence:.2f} ops={ops}")
+                logger.info(f"← llm: kind={result.kind} conf={result.confidence:.2f} ops={ops}")
                 logger.info(f"  reasoning: {result.reasoning}")
                 if not fut.done():
                     fut.set_result(result)
