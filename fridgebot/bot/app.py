@@ -340,22 +340,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"update {display!r} entry={entry} expiry={expiry} {'ok' if ok else 'not_found'}")
             report.append(f"{icon} {display}" if ok else f"⚠️ {display} 不在冰箱中")
         elif op.intent in ("eat", "finish"):
-            # 价格快照：从库存中该项的最旧一条取单价（可能为 None），为未来每顿饭成本留底。
-            existing = await db.oldest_item(op.item)
-            meal_items.append(
-                MealItem(
-                    name=op.item,
-                    original_name=op.original_name,
-                    price_cents=existing.price_cents if existing else None,
-                )
-            )
+            # 成本归账：只有"吃完"（从冰箱移除该行）才把该项全价计入餐食成本，
+            # 价格取自被移除的那一行；移除后无法再被吃完，故每行只计一次。
+            # "吃了但没吃完"：留库存、本餐成本记 None，避免没吃完也计价、以及重复计价。
+            price = None
             if op.intent == "finish":
+                existing = await db.oldest_item(op.item)
+                price = existing.price_cents if existing else None
                 ok = await db.consume_oldest(op.item)
-                logger.info(f"finish {display!r} {'removed' if ok else 'not_found'}")
+                logger.info(f"finish {display!r} price={price} {'removed' if ok else 'not_found'}")
                 report.append(f"{icon} {display} 吃完" if ok else f"🍽 {display} 吃完（冰箱中无此项）")
             else:
-                logger.info(f"eat {display!r} (kept)")
+                logger.info(f"eat {display!r} (kept, no cost)")
                 report.append(f"{icon} {display} 吃了")
+            meal_items.append(
+                MealItem(name=op.item, original_name=op.original_name, price_cents=price)
+            )
         elif op.intent == "discard":
             ok = await db.consume_oldest(op.item)
             logger.info(f"discard {display!r} {'removed' if ok else 'not_found'}")
