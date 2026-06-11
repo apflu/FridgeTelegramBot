@@ -155,6 +155,15 @@ async def on_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_only
+async def on_cleardebug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """debug：清空购买流水（总开销归零）。餐食记录不动。"""
+    db: Database = context.application.bot_data["db"]
+    n = await db.clear_purchases()
+    logger.info(f"debug: cleared {n} purchase row(s)")
+    await update.message.reply_text(f"🧹 已清空购买流水 {n} 条，总开销归零。（餐食记录未动）")
+
+
+@owner_only
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     logger.info(f"msg: {text!r}")
@@ -479,6 +488,7 @@ def main():
     app.add_handler(CommandHandler("due", on_due, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("mute", on_mute, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("unmute", on_unmute, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("cleardebug", on_cleardebug, filters=filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(private_text, on_message))
     app.add_handler(MessageHandler(private_photo, on_photo))

@@ -353,6 +353,12 @@ class Database:
         await self._c.commit()
         return cur.rowcount or 0
 
+    async def clear_purchases(self) -> int:
+        """debug：清空全部购买流水（总开销归零）。返回删除条数。"""
+        cur = await self._c.execute("DELETE FROM purchases")
+        await self._c.commit()
+        return cur.rowcount or 0
+
     async def spend_cents(self, start: date | None = None, end: date | None = None) -> int:
         """统计 [start, end] 区间的花销（含端点）；不传则全时段。现算求和。"""
         where, params = self._date_range_clause("purchase_date", start, end)
