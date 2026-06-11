@@ -30,7 +30,12 @@ from fridgebot.llm import (
 )
 from fridgebot.storage import Database, MealItem
 
-from .render import render_inventory, render_receipt_report, render_stats
+from .render import (
+    render_expiry_reminder,
+    render_inventory,
+    render_receipt_report,
+    render_stats,
+)
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OWNER_ID = int(os.environ["TELEGRAM_OWNER_ID"])
@@ -38,6 +43,7 @@ CHANNEL_ID: str | None = os.getenv("TELEGRAM_CHANNEL_ID") or None
 DB_PATH = os.getenv("DB_PATH", "fridge.db")
 DAILY_REFRESH_HOUR = int(os.getenv("DAILY_REFRESH_HOUR", "8"))
 CURRENCY = os.getenv("CURRENCY", "€")
+REMINDERS_KEY = "reminders_enabled"  # kv 键；缺省视为开启（按 DB 存，天然每用户独立）
 
 PENDING: dict[str, ParsedInput] = {}
 ICONS = {"add": "➕", "update": "✏️", "eat": "🍽", "finish": "🍽", "discard": "🗑"}
@@ -72,7 +78,9 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 冰箱里还有啥\n"
         "🧾 拍超市收据照片 → 自动记录食材与价格（保质期留空）\n"
         "⏳ /estimate → 给保质期未知的食材批量估算保质期\n"
-        "📊 /stats → 总开销 / 餐数 / 平均每餐"
+        "📊 /stats → 总开销 / 餐数 / 平均每餐\n"
+        "⏰ /due → 立即查看今天到期或已过期的食材\n"
+        "🔕 /mute、🔔 /unmute → 关闭 / 开启每日到期提醒"
     )
 
 
@@ -119,6 +127,31 @@ async def on_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     meals = await db.count_meals()
     recent = await db.recent_meals(limit=5)
     await update.message.reply_text(render_stats(spend, meals, CURRENCY, recent))
+
+
+@owner_only
+async def on_due(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db: Database = context.application.bot_data["db"]
+    today = date.today()
+    due = await db.items_due_by(today)
+    if not due:
+        await update.message.reply_text("✅ 没有今天到期或已过期的食材")
+        return
+    await update.message.reply_text(render_expiry_reminder(due, today))
+
+
+@owner_only
+async def on_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db: Database = context.application.bot_data["db"]
+    await set_reminders(db, False)
+    await update.message.reply_text("🔕 已关闭每日到期提醒，发 /unmute 可重新开启")
+
+
+@owner_only
+async def on_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db: Database = context.application.bot_data["db"]
+    await set_reminders(db, True)
+    await update.message.reply_text("🔔 已开启每日到期提醒")
 
 
 @owner_only
@@ -246,6 +279,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     action, _, token = q.data.partition(":")
 
+    # 关闭到期提醒：内联按钮，写 DB 开关（持久），移除按钮并提示如何重开。
+    if action == "mute":
+        db: Database = context.application.bot_data["db"]
+        await set_reminders(db, False)
+        logger.info("reminders muted via button")
+        await q.edit_message_text(f"{q.message.text}\n\n🔕 已关闭到期提醒（/unmute 重开）")
+        return
+
     # 撤销收据入库：不依赖内存 PENDING，靠 DB 里的 batch_id 持久撤销（进程重启仍可用）。
     if action == "undo":
         db: Database = context.application.bot_data["db"]
@@ -347,6 +388,49 @@ async def daily_refresh_job(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("daily refresh failed")
 
 
+def reminder_targets(context: ContextTypes.DEFAULT_TYPE) -> list[tuple[int | str, Database]]:
+    """到期提醒的收件人 (chat_id, db) 列表。
+    多用户扩展点：未来改为遍历每用户的 (uid, db)（每用户独立 DB 的注册表）。
+    现在只有 owner + 单一全局 db。"""
+    db: Database = context.application.bot_data["db"]
+    return [(OWNER_ID, db)]
+
+
+async def reminders_enabled(db: Database) -> bool:
+    return (await db.get_kv(REMINDERS_KEY)) != "0"  # 缺省（无记录）= 开启
+
+
+async def set_reminders(db: Database, enabled: bool) -> None:
+    await db.set_kv(REMINDERS_KEY, "1" if enabled else "0")
+
+
+async def send_expiry_reminder(bot, db: Database, chat_id: int | str) -> bool:
+    """有"今天到期或已过期"的项才发一条提醒；提醒被关闭或无到期项则不发。返回是否发送。"""
+    if not await reminders_enabled(db):
+        return False
+    today = date.today()
+    due = await db.items_due_by(today)
+    if not due:
+        return False
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔕 关闭到期提醒", callback_data="mute")]]
+    )
+    await bot.send_message(
+        chat_id=chat_id, text=render_expiry_reminder(due, today), reply_markup=keyboard
+    )
+    return True
+
+
+async def expiry_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("running expiry reminder")
+    for chat_id, db in reminder_targets(context):
+        try:
+            if await send_expiry_reminder(context.bot, db, chat_id):
+                logger.info(f"expiry reminder sent to {chat_id}")
+        except Exception:
+            logger.exception(f"expiry reminder failed for {chat_id}")
+
+
 async def post_init(app: Application):
     db = Database(DB_PATH)
     await db.connect()
@@ -392,11 +476,15 @@ def main():
     app.add_handler(CommandHandler("start", on_start, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("estimate", on_estimate, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("stats", on_stats, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("due", on_due, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("mute", on_mute, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("unmute", on_unmute, filters=filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(private_text, on_message))
     app.add_handler(MessageHandler(private_photo, on_photo))
     app.add_error_handler(on_error)
     app.job_queue.run_daily(daily_refresh_job, time=time(hour=DAILY_REFRESH_HOUR))
+    app.job_queue.run_daily(expiry_reminder_job, time=time(hour=DAILY_REFRESH_HOUR))
     app.run_polling()
 
 

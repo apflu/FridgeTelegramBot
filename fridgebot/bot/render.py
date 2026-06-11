@@ -76,6 +76,16 @@ def render_inventory(items: list[Item], today: date) -> str:
     return "\n".join(lines)
 
 
+def render_expiry_reminder(items: list[Item], today: date) -> str:
+    """到期提醒：传入的应是已到期/已过期的项（expiry <= today）。"""
+    lines = ["⏰ 到期提醒：以下食材今天到期或已过期", ""]
+    for it in sorted(items, key=lambda x: x.expiry_date):
+        icon, label = _status(it.expiry_date - today)
+        name = f"{it.name} ({it.original_name})" if it.original_name else it.name
+        lines.append(f"{icon} {name} · {label}（{it.expiry_date.strftime('%m-%d')}）")
+    return "\n".join(lines)
+
+
 def _status(delta: timedelta) -> tuple[str, str]:
     days = delta.days
     if days < 0:

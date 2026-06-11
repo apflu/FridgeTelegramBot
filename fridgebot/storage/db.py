@@ -213,6 +213,16 @@ class Database:
         )
         await self._c.commit()
 
+    async def items_due_by(self, cutoff: date) -> list[Item]:
+        """保质期已知且 <= cutoff 的项（到期或已过期）；保质期未知的不计入。"""
+        async with self._c.execute(
+            f"SELECT {self._COLUMNS} FROM items "
+            "WHERE expiry_date IS NOT NULL AND expiry_date <= ? ORDER BY expiry_date, id",
+            (cutoff.isoformat(),),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [self._row_to_item(r) for r in rows]
+
     async def _oldest_id(self, name: str) -> int | None:
         async with self._c.execute(
             "SELECT id FROM items WHERE name = ? ORDER BY entry_date, id LIMIT 1",
