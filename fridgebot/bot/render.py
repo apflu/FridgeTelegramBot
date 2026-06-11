@@ -1,6 +1,33 @@
 from datetime import date, timedelta
 
-from db import Item
+from fridgebot.llm import ReceiptLine
+from fridgebot.storage import Item
+
+_CATEGORY_ICON = {"fresh": "🥬", "frozen": "❄️"}
+
+
+def _money(cents: int, currency: str) -> str:
+    return f"{currency}{cents / 100:.2f}"
+
+
+def render_receipt_report(
+    lines: list[ReceiptLine],
+    total_cents: int,
+    currency: str = "€",
+    low_confidence: bool = False,
+) -> str:
+    header = "🧾 已入库（来自收据）"
+    out = [header, ""]
+    if low_confidence:
+        out.append("⚠️ 识别置信度较低，请核对")
+        out.append("")
+    for ln in lines:
+        icon = _CATEGORY_ICON.get(ln.category, "🥬")
+        name = f"{ln.name} ({ln.original_name})" if ln.original_name else ln.name
+        qty = f" ×{ln.quantity}" if ln.quantity > 1 else ""
+        out.append(f"{icon} {name}{qty} · {_money(ln.unit_price_cents, currency)}")
+    out.extend(["", f"合计 {_money(total_cents, currency)}"])
+    return "\n".join(out)
 
 
 def render_inventory(items: list[Item], today: date) -> str:

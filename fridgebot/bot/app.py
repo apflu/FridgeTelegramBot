@@ -6,7 +6,7 @@ from functools import wraps
 from dotenv import load_dotenv
 from loguru import logger
 
-import logconfig
+from fridgebot import logging_config as logconfig
 
 load_dotenv()
 logconfig.setup(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -22,16 +22,17 @@ from telegram.ext import (
     filters,
 )
 
-from db import Database
-from llm import ParsedInput
-from parse_queue import ParseQueue
-from render import render_inventory
+from fridgebot.llm import ParsedInput, ParseQueue, parse_receipt_with_retry
+from fridgebot.storage import Database
+
+from .render import render_inventory, render_receipt_report
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OWNER_ID = int(os.environ["TELEGRAM_OWNER_ID"])
 CHANNEL_ID: str | None = os.getenv("TELEGRAM_CHANNEL_ID") or None
 DB_PATH = os.getenv("DB_PATH", "fridge.db")
 DAILY_REFRESH_HOUR = int(os.getenv("DAILY_REFRESH_HOUR", "8"))
+CURRENCY = os.getenv("CURRENCY", "€")
 
 PENDING: dict[str, ParsedInput] = {}
 ICONS = {"add": "➕", "consume": "➖", "update": "✏️"}
@@ -119,10 +120,77 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_only
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db: Database = context.application.bot_data["db"]
+    queue: ParseQueue = context.application.bot_data["queue"]
+
+    photo = update.message.photo[-1]  # 最大尺寸
+    tg_file = await photo.get_file()
+    image_bytes = bytes(await tg_file.download_as_bytearray())
+    logger.info(f"receipt photo: {len(image_bytes)} bytes")
+    notice = await update.message.reply_text("📷 识别收据中…")
+
+    try:
+        receipt = await queue.submit_job(
+            lambda: parse_receipt_with_retry(image_bytes, date.today()),
+            label="receipt",
+        )
+    except Exception as e:
+        logger.exception("receipt parse failed")
+        await notice.edit_text(f"❌ 识别失败：{e}")
+        return
+
+    logger.info(f"← receipt: {len(receipt.lines)} line(s) conf={receipt.confidence:.2f}")
+    logger.info(f"  reasoning: {receipt.reasoning}")
+    if not receipt.lines:
+        await notice.edit_text(f"🤔 没识别到生鲜/速冻食材\n{receipt.reasoning}")
+        return
+
+    batch_id = uuid.uuid4().hex[:12]
+    today = date.today()
+    total = 0
+    for ln in receipt.lines:
+        expiry = date.fromisoformat(ln.expiry_date) if ln.expiry_date else today
+        qty = max(1, ln.quantity)
+        for _ in range(qty):
+            await db.add_item(
+                ln.name,
+                today,
+                expiry,
+                original_name=ln.original_name,
+                price_cents=ln.unit_price_cents,
+                batch_id=batch_id,
+                category=ln.category,
+            )
+        total += ln.unit_price_cents * qty
+        display = f"{ln.name} ({ln.original_name})" if ln.original_name else ln.name
+        logger.info(f"add {display!r} ×{qty} price={ln.unit_price_cents} batch={batch_id}")
+
+    text = render_receipt_report(
+        receipt.lines, total, CURRENCY, low_confidence=receipt.confidence < 0.6
+    )
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("↩️ 撤销本单", callback_data=f"undo:{batch_id}")]]
+    )
+    await notice.edit_text(text, reply_markup=keyboard)
+    await refresh_channel(context)
+
+
+@owner_only
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     action, _, token = q.data.partition(":")
+
+    # 撤销收据入库：不依赖内存 PENDING，靠 DB 里的 batch_id 持久撤销（进程重启仍可用）。
+    if action == "undo":
+        db: Database = context.application.bot_data["db"]
+        n = await db.delete_batch(token)
+        logger.info(f"undo batch {token}: removed {n} item(s)")
+        await q.edit_message_text(f"↩️ 已撤销本单，移除 {n} 项")
+        await refresh_channel(context)
+        return
+
     parsed = PENDING.pop(token, None)
     if parsed is None:
         await q.edit_message_text("⌛ 确认已失效，请重新输入")
@@ -229,9 +297,15 @@ def main():
         & filters.ChatType.PRIVATE
         & filters.UpdateType.MESSAGE
     )
+    private_photo = (
+        filters.PHOTO
+        & filters.ChatType.PRIVATE
+        & filters.UpdateType.MESSAGE
+    )
     app.add_handler(CommandHandler("start", on_start, filters=filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(private_text, on_message))
+    app.add_handler(MessageHandler(private_photo, on_photo))
     app.add_error_handler(on_error)
     app.job_queue.run_daily(daily_refresh_job, time=time(hour=DAILY_REFRESH_HOUR))
     app.run_polling()

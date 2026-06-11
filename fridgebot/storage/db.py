@@ -11,7 +11,10 @@ CREATE TABLE IF NOT EXISTS items (
     name TEXT NOT NULL,
     original_name TEXT,
     entry_date TEXT NOT NULL,
-    expiry_date TEXT NOT NULL
+    expiry_date TEXT NOT NULL,
+    price_cents INTEGER,
+    batch_id TEXT,
+    category TEXT
 );
 CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
@@ -27,6 +30,12 @@ class Item:
     entry_date: date
     expiry_date: date
     original_name: str | None = None
+    # 单价（分），收据流写入；文字流为 None。整数避免成本累加浮点误差。
+    price_cents: int | None = None
+    # 入库批次：一张收据=一个 batch_id，用于撤销与未来按单/按饭归集。
+    batch_id: str | None = None
+    # 'fresh' / 'frozen'，仅收据流标记。
+    category: str | None = None
 
 
 class Database:
@@ -45,6 +54,12 @@ class Database:
             cols = {row[1] for row in await cur.fetchall()}
         if "original_name" not in cols:
             await self._c.execute("ALTER TABLE items ADD COLUMN original_name TEXT")
+        if "price_cents" not in cols:
+            await self._c.execute("ALTER TABLE items ADD COLUMN price_cents INTEGER")
+        if "batch_id" not in cols:
+            await self._c.execute("ALTER TABLE items ADD COLUMN batch_id TEXT")
+        if "category" not in cols:
+            await self._c.execute("ALTER TABLE items ADD COLUMN category TEXT")
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -56,22 +71,27 @@ class Database:
         assert self._conn is not None, "Database not connected"
         return self._conn
 
+    _COLUMNS = "id, name, entry_date, expiry_date, original_name, price_cents, batch_id, category"
+
+    @staticmethod
+    def _row_to_item(r) -> Item:
+        return Item(
+            id=r[0],
+            name=r[1],
+            entry_date=date.fromisoformat(r[2]),
+            expiry_date=date.fromisoformat(r[3]),
+            original_name=r[4],
+            price_cents=r[5],
+            batch_id=r[6],
+            category=r[7],
+        )
+
     async def list_items(self) -> list[Item]:
         async with self._c.execute(
-            "SELECT id, name, entry_date, expiry_date, original_name "
-            "FROM items ORDER BY expiry_date, id"
+            f"SELECT {self._COLUMNS} FROM items ORDER BY expiry_date, id"
         ) as cur:
             rows = await cur.fetchall()
-        return [
-            Item(
-                id=r[0],
-                name=r[1],
-                entry_date=date.fromisoformat(r[2]),
-                expiry_date=date.fromisoformat(r[3]),
-                original_name=r[4],
-            )
-            for r in rows
-        ]
+        return [self._row_to_item(r) for r in rows]
 
     async def add_item(
         self,
@@ -79,14 +99,41 @@ class Database:
         entry: date,
         expiry: date,
         original_name: str | None = None,
+        price_cents: int | None = None,
+        batch_id: str | None = None,
+        category: str | None = None,
     ) -> int:
         cur = await self._c.execute(
-            "INSERT INTO items (name, original_name, entry_date, expiry_date) "
-            "VALUES (?, ?, ?, ?)",
-            (name, original_name, entry.isoformat(), expiry.isoformat()),
+            "INSERT INTO items "
+            "(name, original_name, entry_date, expiry_date, price_cents, batch_id, category) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                name,
+                original_name,
+                entry.isoformat(),
+                expiry.isoformat(),
+                price_cents,
+                batch_id,
+                category,
+            ),
         )
         await self._c.commit()
         return cur.lastrowid or 0
+
+    async def list_batch(self, batch_id: str) -> list[Item]:
+        async with self._c.execute(
+            f"SELECT {self._COLUMNS} FROM items WHERE batch_id = ? ORDER BY id",
+            (batch_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [self._row_to_item(r) for r in rows]
+
+    async def delete_batch(self, batch_id: str) -> int:
+        cur = await self._c.execute(
+            "DELETE FROM items WHERE batch_id = ?", (batch_id,)
+        )
+        await self._c.commit()
+        return cur.rowcount or 0
 
     async def _oldest_id(self, name: str) -> int | None:
         async with self._c.execute(

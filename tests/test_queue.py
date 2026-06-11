@@ -3,12 +3,12 @@ from datetime import date
 
 from dotenv import load_dotenv
 
-import logconfig
+from fridgebot import logging_config as logconfig
 
 load_dotenv()
 logconfig.setup()
 
-from parse_queue import ParseQueue
+from fridgebot.llm import ParseQueue
 
 TODAY = date(2026, 4, 24)
 

@@ -4,12 +4,12 @@ from datetime import date
 
 from dotenv import load_dotenv
 
-import logconfig
+from fridgebot import logging_config as logconfig
 
 load_dotenv()
 logconfig.setup()
 
-from llm import parse_with_retry
+from fridgebot.llm import parse_with_retry
 
 # 两次调用间隔（秒），按 provider 限速调整。
 # Gemini 免费 gemini-2.5-flash 约 10 RPM → 6s 足够；付费 OpenAI 兼容端点可设 0。

@@ -1,11 +1,13 @@
 import asyncio
 import os
 from datetime import date
-from typing import Literal
+from typing import Awaitable, Callable, Literal, TypeVar
 
 import openai
 from loguru import logger
 from pydantic import BaseModel, Field, ValidationError
+
+T = TypeVar("T")
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 # 自定义 API 入口地址（任意 OpenAI 兼容端点）。留空则用官方 OpenAI 地址。
@@ -145,18 +147,17 @@ def _retry_after(exc: openai.APIStatusError, default: float) -> float:
         return default
 
 
-async def parse_with_retry(
-    user_input: str,
-    today: date | None = None,
-    existing_items: list[str] | None = None,
+async def run_with_retry(
+    call: Callable[[], Awaitable[T]],
     max_attempts: int = 5,
     base_delay: float = 2.0,
-) -> ParsedInput:
+) -> T:
+    """通用重试包装：限速(429)/5xx 按 retry-after 退避，连接错误/JSON 校验失败也重试。"""
     delay = base_delay
     for attempt in range(1, max_attempts + 1):
         last = attempt == max_attempts
         try:
-            return await parse_input(user_input, today, existing_items)
+            return await call()
         except openai.APIStatusError as e:
             if e.status_code not in RETRYABLE_CODES or last:
                 raise
@@ -171,3 +172,17 @@ async def parse_with_retry(
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60)
     raise RuntimeError("unreachable")
+
+
+async def parse_with_retry(
+    user_input: str,
+    today: date | None = None,
+    existing_items: list[str] | None = None,
+    max_attempts: int = 5,
+    base_delay: float = 2.0,
+) -> ParsedInput:
+    return await run_with_retry(
+        lambda: parse_input(user_input, today, existing_items),
+        max_attempts=max_attempts,
+        base_delay=base_delay,
+    )

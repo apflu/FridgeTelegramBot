@@ -1,12 +1,15 @@
 import asyncio
 from datetime import date
+from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
-from llm import ParsedInput, parse_with_retry
+from .parser import ParsedInput, parse_with_retry
 
 
 class ParseQueue:
+    """串行限速队列：所有 LLM 调用（文字解析、收据视觉解析）共用同一 RPM 预算。"""
+
     def __init__(self, min_interval: float = 0.0):
         self._queue: asyncio.Queue = asyncio.Queue()
         self._worker: asyncio.Task | None = None
@@ -28,36 +31,48 @@ class ParseQueue:
             pass
         self._worker = None
 
+    async def submit_job(
+        self,
+        factory: Callable[[], Awaitable[Any]],
+        label: str = "job",
+    ) -> Any:
+        """把任意 async 任务排入限速队列，串行执行后返回其结果。"""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        await self._queue.put((fut, factory, label))
+        return await fut
+
     async def submit(
         self,
         user_input: str,
         today: date | None = None,
         existing_items: list[str] | None = None,
     ) -> ParsedInput:
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[ParsedInput] = loop.create_future()
-        await self._queue.put((fut, user_input, today, existing_items))
-        return await fut
+        async def job() -> ParsedInput:
+            result = await parse_with_retry(user_input, today, existing_items)
+            ops = [f"{o.intent} {o.item}" for o in result.operations]
+            logger.info(f"← llm: kind={result.kind} conf={result.confidence:.2f} ops={ops}")
+            logger.info(f"  reasoning: {result.reasoning}")
+            return result
+
+        return await self.submit_job(job, label=f"llm: {user_input!r}")
 
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
         while True:
-            fut, user_input, today, existing_items = await self._queue.get()
+            fut, factory, label = await self._queue.get()
             try:
                 if self._min_interval > 0:
                     elapsed = loop.time() - self._last_call
                     if elapsed < self._min_interval:
                         await asyncio.sleep(self._min_interval - elapsed)
                 self._last_call = loop.time()
-                logger.info(f"→ llm: {user_input!r}")
-                result = await parse_with_retry(user_input, today, existing_items)
-                ops = [f"{o.intent} {o.item}" for o in result.operations]
-                logger.info(f"← llm: kind={result.kind} conf={result.confidence:.2f} ops={ops}")
-                logger.info(f"  reasoning: {result.reasoning}")
+                logger.info(f"→ {label}")
+                result = await factory()
                 if not fut.done():
                     fut.set_result(result)
             except Exception as e:
-                logger.exception("parse failed")
+                logger.exception("queue job failed")
                 if not fut.done():
                     fut.set_exception(e)
             finally:

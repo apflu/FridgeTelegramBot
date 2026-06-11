@@ -9,8 +9,7 @@ _NOISY_LOGGERS = (
     "urllib3",
     "telegram",
     "apscheduler",
-    "google_genai",
-    "google.auth",
+    "openai",
 )
 
 _FORMAT = (
