@@ -8,6 +8,7 @@ from loguru import logger
 from pydantic import BaseModel, Field, ValidationError
 
 T = TypeVar("T")
+M = TypeVar("M", bound=BaseModel)
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 # 自定义 API 入口地址（任意 OpenAI 兼容端点）。留空则用官方 OpenAI 地址。
@@ -123,6 +124,36 @@ def _client() -> openai.AsyncOpenAI:
     return openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], base_url=BASE_URL)
 
 
+# 输出格式策略：默认 json_object（prompt 描述 schema + pydantic 校验，端点兼容性最广）；
+# 置 LLM_STRUCTURED_OUTPUT=true 切换为 json_schema 约束解码（更强格式保证，需端点支持）。
+# 两套实现都保留在 complete() 里，靠环境变量切换，回退无需改代码。
+STRUCTURED_OUTPUT = os.getenv("LLM_STRUCTURED_OUTPUT", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+async def complete(messages: list, schema: type[M], model: str | None = None) -> M:
+    """统一 LLM 出口：按 STRUCTURED_OUTPUT 选择约束解码或 json_object+校验，返回校验后的 schema 实例。"""
+    client = _client()
+    model = model or MODEL
+    if STRUCTURED_OUTPUT:
+        response = await client.chat.completions.parse(
+            model=model,
+            messages=messages,
+            response_format=schema,
+            temperature=0.1,
+        )
+        parsed = response.choices[0].message.parsed
+        if parsed is None:
+            raise ValueError("structured output 为空（refusal 或截断）")
+        return parsed
+    response = await client.chat.completions.create(
+        model=model,
+        messages=messages,
+        response_format={"type": "json_object"},
+        temperature=0.1,
+    )
+    return schema.model_validate_json(response.choices[0].message.content or "")
+
+
 async def parse_input(
     user_input: str,
     today: date | None = None,
@@ -130,18 +161,11 @@ async def parse_input(
 ) -> ParsedInput:
     today = today or date.today()
     user_prompt = _build_user_prompt(today, user_input, existing_items)
-
-    response = await _client().chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.1,
-    )
-    content = response.choices[0].message.content or ""
-    return ParsedInput.model_validate_json(content)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+    return await complete(messages, ParsedInput)
 
 
 def _retry_after(exc: openai.APIStatusError, default: float) -> float:

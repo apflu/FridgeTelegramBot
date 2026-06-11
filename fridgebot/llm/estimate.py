@@ -2,7 +2,7 @@ from datetime import date
 
 from pydantic import BaseModel
 
-from .parser import MODEL, _client, run_with_retry
+from .parser import complete, run_with_retry
 
 
 class ExpiryGuess(BaseModel):
@@ -47,16 +47,11 @@ def _build_prompt(entries: list[Entry], today: date) -> str:
 async def estimate_expiry(entries: list[Entry], today: date | None = None) -> ExpiryGuesses:
     today = today or date.today()
     prompt = _build_prompt(entries, today)
-    response = await _client().chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": ESTIMATE_SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.1,
-    )
-    return ExpiryGuesses.model_validate_json(response.choices[0].message.content or "")
+    messages = [
+        {"role": "system", "content": ESTIMATE_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    return await complete(messages, ExpiryGuesses)
 
 
 async def estimate_expiry_with_retry(

@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from .parser import MODEL, _client, run_with_retry
+from .parser import MODEL, complete, run_with_retry
 
 # 视觉模型：默认回退到文字模型（当前两者都是 gemini-2.5-flash，皆多模态）。
 VISION_MODEL = os.getenv("OPENAI_VISION_MODEL") or MODEL
@@ -76,23 +76,17 @@ async def parse_receipt(image_bytes: bytes, today: date | None = None) -> Parsed
     b64 = base64.b64encode(image_bytes).decode()
     data_url = f"data:image/jpeg;base64,{b64}"
 
-    response = await _client().chat.completions.create(
-        model=VISION_MODEL,
-        messages=[
-            {"role": "system", "content": RECEIPT_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": f"今天（收据日期）：{today.isoformat()}。识别这张超市收据。"},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            },
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.1,
-    )
-    content = response.choices[0].message.content or ""
-    return ParsedReceipt.model_validate_json(content)
+    messages = [
+        {"role": "system", "content": RECEIPT_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"今天（收据日期）：{today.isoformat()}。识别这张超市收据。"},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        },
+    ]
+    return await complete(messages, ParsedReceipt, model=VISION_MODEL)
 
 
 async def parse_receipt_with_retry(
