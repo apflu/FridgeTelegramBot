@@ -8,7 +8,9 @@ import os
 import tempfile
 from datetime import date
 
-from fridgebot.storage import Database
+import aiosqlite
+
+from fridgebot.storage import Database, MealItem
 
 TODAY = date(2026, 4, 24)
 EXPIRY = date(2026, 5, 1)
@@ -60,9 +62,76 @@ async def main() -> None:
     chicken = await db.list_batch(b2)
     assert len(chicken) == 1 and chicken[0].price_cents == 450
 
+    # 空保质期（发票流）：能入库、出现在 list_unknown_expiry、且 set_expiry 后转为已知。
+    onion_id = await db.add_item("洋葱", TODAY, None, price_cents=88, batch_id="b3", category="fresh")
+    unknown = await db.list_unknown_expiry()
+    assert [i.id for i in unknown] == [onion_id], "应只有洋葱保质期未知"
+    assert unknown[0].expiry_date is None
+    await db.set_expiry(onion_id, date(2026, 5, 3))
+    assert await db.list_unknown_expiry() == [], "set_expiry 后不应再有未知项"
+
+    # 购买流水：现算求和 + 按日期区间过滤 + 按 batch 撤销。
+    await db.add_purchase(date(2026, 2, 10), "牛肉", 676, batch_id="bp1")
+    await db.add_purchase(date(2026, 2, 20), "土豆", 279, batch_id="bp1")
+    await db.add_purchase(date(2026, 3, 5), "生菜", 88, batch_id="bp2")
+    assert await db.spend_cents() == 676 + 279 + 88, "全时段合计应为 1043"
+    feb = await db.spend_cents(date(2026, 2, 1), date(2026, 2, 28))
+    assert feb == 676 + 279, f"2月应为 955，得到 {feb}"
+    await db.delete_purchases("bp1")  # 撤销 2 月那单
+    assert await db.spend_cents() == 88, "撤销后只剩生菜 88"
+    assert await db.spend_cents(date(2026, 2, 1), date(2026, 2, 28)) == 0
+
+    # 餐食记录：餐数 + 内容 + 最近在前。
+    await db.add_meal(date(2026, 6, 11), [MealItem("牛腱肉片", "JB-BEINSCHEIBE", 676), MealItem("土豆", None, 279)])
+    await db.add_meal(date(2026, 6, 11), [MealItem("生菜")])
+    assert await db.count_meals() == 2, "应有 2 餐"
+    recent = await db.recent_meals(limit=5)
+    assert recent[0].items[0].name == "生菜", "最近一餐应在最前"
+    assert len(recent[1].items) == 2 and recent[1].items[0].price_cents == 676
+
     await db.close()
-    print("OK: list_batch / delete_batch / price_cents 全部断言通过")
+    print("OK: batch / price / 空保质期 / 购买流水(含区间) / 餐食记录 全部断言通过")
+
+
+async def test_migration() -> None:
+    """旧库 expiry_date NOT NULL 且缺新列 → 打开后应迁移为可空并保留数据。"""
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "old.db")
+    conn = await aiosqlite.connect(path)
+    await conn.executescript(
+        """
+        CREATE TABLE items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            entry_date TEXT NOT NULL,
+            expiry_date TEXT NOT NULL
+        );
+        INSERT INTO items (name, entry_date, expiry_date)
+            VALUES ('旧货', '2026-04-01', '2026-04-10');
+        """
+    )
+    await conn.commit()
+    await conn.close()
+
+    db = Database(path)
+    await db.connect()  # 触发 _migrate：ADD COLUMN ×4 + 重建表去 NOT NULL
+    items = await db.list_items()
+    assert len(items) == 1 and items[0].name == "旧货", "旧数据应保留"
+    assert items[0].expiry_date == date(2026, 4, 10)
+    # 迁移前这条会因 NOT NULL 失败；迁移后应成功。
+    await db.add_item("无期限", date(2026, 4, 24), None)
+    unknown = await db.list_unknown_expiry()
+    assert len(unknown) == 1 and unknown[0].name == "无期限"
+    await db.close()
+
+    # 幂等：再次连接不应再重建、不报错。
+    db2 = Database(path)
+    await db2.connect()
+    assert len(await db2.list_items()) == 2
+    await db2.close()
+    print("OK: 旧库 NOT NULL → 可空 迁移成功且幂等")
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+    asyncio.run(test_migration())

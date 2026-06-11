@@ -1,3 +1,4 @@
+from .estimate import ExpiryGuesses, estimate_expiry, estimate_expiry_with_retry
 from .parser import (
     Operation,
     ParsedInput,
@@ -19,4 +20,7 @@ __all__ = [
     "ReceiptLine",
     "parse_receipt",
     "parse_receipt_with_retry",
+    "ExpiryGuesses",
+    "estimate_expiry",
+    "estimate_expiry_with_retry",
 ]

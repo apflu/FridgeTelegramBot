@@ -16,8 +16,8 @@ class ReceiptLine(BaseModel):
     original_name: str | None = None   # 收据原文（如德文）
     unit_price_cents: int              # 单价（分）；按重量项见 prompt 规则
     quantity: int = 1                  # 件数（入库时展开成 N 行）
-    expiry_date: str                   # 保守估计 YYYY-MM-DD
     category: Literal["fresh", "frozen"]
+    # 注意：发票流不推断保质期，入库时 expiry 留空，由用户运行 /estimate 命令再批量估算。
 
 
 class ParsedReceipt(BaseModel):
@@ -41,21 +41,17 @@ RECEIPT_SYSTEM_PROMPT = """你是一个家用冰箱食材管理助手，从一�
 - category："fresh" 或 "frozen"
 - quantity：件数（整数）
 - unit_price_cents：**单价**，单位是**分**（€0.79 → 79，€4.50 → 450）
-- expiry_date：保质期，YYYY-MM-DD
+
+**不要估算保质期**，本任务只负责识别食材与价格。
 
 价格与数量规则：
 - 按件计价（如「酸奶 3 × €0.79」）：quantity=3，unit_price_cents=79（单价，不是总价）
 - 按重量计价（如「0.5kg 鸡腿 €4.50」）：无法拆成整数件 → quantity=1，unit_price_cents=450（即实付总价），并把重量写进 name（「鸡腿 0.5kg」）
 - 收据只给了某项的合计且件数>1，则 unit_price_cents = 合计 / 件数（四舍五入到整数分）
 
-保质期估计（按「冷藏 / 冷冻、未开封、家庭环境」保守估计，以收据日期为今天）：
-- 叶菜/生菜 3–5 天；其他蔬果 5–7 天
-- 生肉/鱼 2–3 天；蛋 2–3 周；奶/酸奶按常规 1–2 周
-- 速冻 30–90 天
-
 confidence（整张收据识别的整体置信度，0–1）：识别清晰且金额明确 → 高；模糊/反光/看不清 → 低。
 
-reasoning：简短说明，尤其哪些项被丢弃、保质期如何估计。
+reasoning：简短说明，尤其哪些项被丢弃。
 
 输出格式：只返回一个 JSON 对象，不要任何额外文字或 markdown 代码块。结构：
 {
@@ -65,8 +61,7 @@ reasoning：简短说明，尤其哪些项被丢弃、保质期如何估计。
       "original_name": 字符串或 null,
       "category": "fresh" | "frozen",
       "quantity": 整数,
-      "unit_price_cents": 整数,
-      "expiry_date": "YYYY-MM-DD"
+      "unit_price_cents": 整数
     }
   ],
   "currency": "EUR",

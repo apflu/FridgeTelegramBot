@@ -22,10 +22,15 @@ from telegram.ext import (
     filters,
 )
 
-from fridgebot.llm import ParsedInput, ParseQueue, parse_receipt_with_retry
-from fridgebot.storage import Database
+from fridgebot.llm import (
+    ParsedInput,
+    ParseQueue,
+    estimate_expiry_with_retry,
+    parse_receipt_with_retry,
+)
+from fridgebot.storage import Database, MealItem
 
-from .render import render_inventory, render_receipt_report
+from .render import render_inventory, render_receipt_report, render_stats
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OWNER_ID = int(os.environ["TELEGRAM_OWNER_ID"])
@@ -35,7 +40,7 @@ DAILY_REFRESH_HOUR = int(os.getenv("DAILY_REFRESH_HOUR", "8"))
 CURRENCY = os.getenv("CURRENCY", "€")
 
 PENDING: dict[str, ParsedInput] = {}
-ICONS = {"add": "➕", "consume": "➖", "update": "✏️"}
+ICONS = {"add": "➕", "update": "✏️", "eat": "🍽", "finish": "🍽", "discard": "🗑"}
 
 
 def owner_only(handler):
@@ -58,12 +63,62 @@ def _channel_id() -> str | int | None:
 @owner_only
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "冰箱助手在线。发食材描述即可，比如：\n"
+        "冰箱助手在线。\n"
+        "📝 发食材描述，比如：\n"
         "• 今天买了一颗生菜和一盒鸡蛋\n"
-        "• 牛奶还能放 3 天\n"
-        "• 酸奶过期了扔了\n"
-        "• 冰箱里还有啥"
+        "• 今天吃了牛腱和土豆（记一餐，不移除）\n"
+        "• 牛奶喝完了（记一餐 + 移除）\n"
+        "• 酸奶过期扔了（移除，不算吃）\n"
+        "• 冰箱里还有啥\n"
+        "🧾 拍超市收据照片 → 自动记录食材与价格（保质期留空）\n"
+        "⏳ /estimate → 给保质期未知的食材批量估算保质期\n"
+        "📊 /stats → 总开销 / 餐数 / 平均每餐"
     )
+
+
+@owner_only
+async def on_estimate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db: Database = context.application.bot_data["db"]
+    queue: ParseQueue = context.application.bot_data["queue"]
+
+    items = await db.list_unknown_expiry()
+    if not items:
+        await update.message.reply_text("✅ 没有保质期未知的食材")
+        return
+
+    notice = await update.message.reply_text(f"⏳ 正在估算 {len(items)} 项保质期…")
+    entries = [(it.name, it.original_name, it.entry_date) for it in items]
+    try:
+        result = await queue.submit_job(
+            lambda: estimate_expiry_with_retry(entries, date.today()),
+            label=f"estimate {len(items)} item(s)",
+        )
+    except Exception as e:
+        logger.exception("estimate failed")
+        await notice.edit_text(f"❌ 估算失败：{e}")
+        return
+
+    updated = 0
+    for g in result.guesses:
+        if 0 <= g.index < len(items) and g.expiry_date:
+            try:
+                await db.set_expiry(items[g.index].id, date.fromisoformat(g.expiry_date))
+                updated += 1
+            except ValueError:
+                logger.warning(f"bad expiry_date from llm: {g.expiry_date!r}")
+
+    logger.info(f"estimate: updated {updated}/{len(items)} item(s)")
+    await notice.edit_text(f"✅ 已估算并更新 {updated} 项保质期")
+    await refresh_channel(context)
+
+
+@owner_only
+async def on_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db: Database = context.application.bot_data["db"]
+    spend = await db.spend_cents()
+    meals = await db.count_meals()
+    recent = await db.recent_meals(limit=5)
+    await update.message.reply_text(render_stats(spend, meals, CURRENCY, recent))
 
 
 @owner_only
@@ -108,6 +163,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parts.append(f"到期 → {op.expiry_date}")
             if op.entry_date:
                 parts.append(f"入库 → {op.entry_date}")
+        elif op.intent == "eat":
+            parts.append("吃了·留库存")
+        elif op.intent == "finish":
+            parts.append("吃完·移除")
+        elif op.intent == "discard":
+            parts.append("移除")
         summary.append("  " + " · ".join(parts))
 
     token = uuid.uuid4().hex[:12]
@@ -150,19 +211,22 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = date.today()
     total = 0
     for ln in receipt.lines:
-        expiry = date.fromisoformat(ln.expiry_date) if ln.expiry_date else today
         qty = max(1, ln.quantity)
         for _ in range(qty):
+            # 发票流不推断保质期：expiry 留空，待用户运行 /estimate 再批量估算。
             await db.add_item(
                 ln.name,
                 today,
-                expiry,
+                None,
                 original_name=ln.original_name,
                 price_cents=ln.unit_price_cents,
                 batch_id=batch_id,
                 category=ln.category,
             )
-        total += ln.unit_price_cents * qty
+        line_total = ln.unit_price_cents * qty
+        total += line_total
+        # 记一笔购买流水（不可变；/stats 现算，撤销本单时按 batch 删除）
+        await db.add_purchase(today, ln.name, line_total, batch_id)
         display = f"{ln.name} ({ln.original_name})" if ln.original_name else ln.name
         logger.info(f"add {display!r} ×{qty} price={ln.unit_price_cents} batch={batch_id}")
 
@@ -186,7 +250,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "undo":
         db: Database = context.application.bot_data["db"]
         n = await db.delete_batch(token)
-        logger.info(f"undo batch {token}: removed {n} item(s)")
+        await db.delete_purchases(token)  # 同步移除该单的购买流水
+        logger.info(f"undo batch {token}: removed {n} item(s) + purchases")
         await q.edit_message_text(f"↩️ 已撤销本单，移除 {n} 项")
         await refresh_channel(context)
         return
@@ -202,27 +267,49 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     db: Database = context.application.bot_data["db"]
     report: list[str] = []
+    meal_items: list[MealItem] = []  # eat + finish → 记入这顿饭
     for op in parsed.operations:
         icon = ICONS[op.intent]
+        display = f"{op.item} ({op.original_name})" if op.original_name else op.item
         if op.intent == "add":
             entry = date.fromisoformat(op.entry_date) if op.entry_date else date.today()
-            expiry = date.fromisoformat(op.expiry_date) if op.expiry_date else entry
+            # 文字流由 LLM 推断保质期；万一缺失则留空（未知），而不是误判为当天过期。
+            expiry = date.fromisoformat(op.expiry_date) if op.expiry_date else None
             await db.add_item(op.item, entry, expiry, original_name=op.original_name)
-            display = f"{op.item} ({op.original_name})" if op.original_name else op.item
             logger.info(f"add {display!r} entry={entry} expiry={expiry}")
             report.append(f"{icon} {display}")
-        elif op.intent == "consume":
-            ok = await db.consume_oldest(op.item)
-            display = f"{op.item} ({op.original_name})" if op.original_name else op.item
-            logger.info(f"consume {display!r} {'ok' if ok else 'not_found'}")
-            report.append(f"{icon} {display}" if ok else f"⚠️ {display} 不在冰箱中")
         elif op.intent == "update":
             entry = date.fromisoformat(op.entry_date) if op.entry_date else None
             expiry = date.fromisoformat(op.expiry_date) if op.expiry_date else None
             ok = await db.update_oldest(op.item, entry=entry, expiry=expiry)
-            display = f"{op.item} ({op.original_name})" if op.original_name else op.item
             logger.info(f"update {display!r} entry={entry} expiry={expiry} {'ok' if ok else 'not_found'}")
             report.append(f"{icon} {display}" if ok else f"⚠️ {display} 不在冰箱中")
+        elif op.intent in ("eat", "finish"):
+            # 价格快照：从库存中该项的最旧一条取单价（可能为 None），为未来每顿饭成本留底。
+            existing = await db.oldest_item(op.item)
+            meal_items.append(
+                MealItem(
+                    name=op.item,
+                    original_name=op.original_name,
+                    price_cents=existing.price_cents if existing else None,
+                )
+            )
+            if op.intent == "finish":
+                ok = await db.consume_oldest(op.item)
+                logger.info(f"finish {display!r} {'removed' if ok else 'not_found'}")
+                report.append(f"{icon} {display} 吃完" if ok else f"🍽 {display} 吃完（冰箱中无此项）")
+            else:
+                logger.info(f"eat {display!r} (kept)")
+                report.append(f"{icon} {display} 吃了")
+        elif op.intent == "discard":
+            ok = await db.consume_oldest(op.item)
+            logger.info(f"discard {display!r} {'removed' if ok else 'not_found'}")
+            report.append(f"{icon} {display} 移除" if ok else f"⚠️ {display} 不在冰箱中")
+
+    if meal_items:
+        await db.add_meal(date.today(), meal_items)
+        logger.info(f"meal recorded: {[m.name for m in meal_items]}")
+        report.append(f"📒 已记录一餐（{len(meal_items)} 项）")
 
     await q.edit_message_text("✅ 已应用：\n" + "\n".join(report))
     await refresh_channel(context)
@@ -303,6 +390,8 @@ def main():
         & filters.UpdateType.MESSAGE
     )
     app.add_handler(CommandHandler("start", on_start, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("estimate", on_estimate, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("stats", on_stats, filters=filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(private_text, on_message))
     app.add_handler(MessageHandler(private_photo, on_photo))
