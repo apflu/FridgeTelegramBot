@@ -359,6 +359,16 @@ class Database:
         await self._c.commit()
         return cur.rowcount or 0
 
+    async def clear_meals(self) -> int:
+        """debug：清空全部餐食记录（餐数归零）。返回删除的餐数。"""
+        async with self._c.execute("SELECT COUNT(*) FROM meals") as cur:
+            row = await cur.fetchone()
+        meals_n = row[0] if row else 0
+        await self._c.execute("DELETE FROM meal_items")
+        await self._c.execute("DELETE FROM meals")
+        await self._c.commit()
+        return meals_n
+
     async def spend_cents(self, start: date | None = None, end: date | None = None) -> int:
         """统计 [start, end] 区间的花销（含端点）；不传则全时段。现算求和。"""
         where, params = self._date_range_clause("purchase_date", start, end)

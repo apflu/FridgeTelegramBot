@@ -156,11 +156,15 @@ async def on_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def on_cleardebug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """debug：清空购买流水（总开销归零）。餐食记录不动。"""
+    """debug：清空购买流水 + 餐食记录（总开销与餐数归零）。冰箱库存不动。"""
     db: Database = context.application.bot_data["db"]
-    n = await db.clear_purchases()
-    logger.info(f"debug: cleared {n} purchase row(s)")
-    await update.message.reply_text(f"🧹 已清空购买流水 {n} 条，总开销归零。（餐食记录未动）")
+    p = await db.clear_purchases()
+    m = await db.clear_meals()
+    logger.info(f"debug: cleared {p} purchase row(s) + {m} meal(s)")
+    await update.message.reply_text(
+        f"🧹 已清空：购买流水 {p} 条、餐食记录 {m} 餐，总开销与餐数归零。\n"
+        f"冰箱库存（含发票录入的食材与单价）保留不动。"
+    )
 
 
 @owner_only
