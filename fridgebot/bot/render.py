@@ -13,14 +13,17 @@ def _money(cents: int, currency: str) -> str:
 def render_stats(
     spend_cents: int,
     meal_count: int,
+    meal_cost_cents: int,
     currency: str = "€",
     recent: list[Meal] | None = None,
 ) -> str:
-    avg = _money(spend_cents // meal_count, currency) if meal_count else "—"
+    # 平均每餐基于餐食成本（吃掉食材的价格快照），与采购流水解耦。
+    avg = _money(meal_cost_cents // meal_count, currency) if meal_count else "—"
     lines = [
         "📊 开销统计",
         "",
-        f"总开销：{_money(spend_cents, currency)}",
+        f"采购花费：{_money(spend_cents, currency)}",
+        f"餐食成本：{_money(meal_cost_cents, currency)}",
         f"餐数：{meal_count}",
         f"平均每餐：{avg}",
     ]
@@ -31,7 +34,9 @@ def render_stats(
                 f"{it.name} ({it.original_name})" if it.original_name else it.name
                 for it in m.items
             )
-            lines.append(f"🍽 {m.eaten_date.strftime('%m-%d')} {names}")
+            cost = sum(it.price_cents or 0 for it in m.items)
+            cost_str = f" · {_money(cost, currency)}" if cost else ""
+            lines.append(f"🍽 {m.eaten_date.strftime('%m-%d')} {names}{cost_str}")
     return "\n".join(lines)
 
 

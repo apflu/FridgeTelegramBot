@@ -124,9 +124,10 @@ async def on_estimate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db: Database = context.application.bot_data["db"]
     spend = await db.spend_cents()
+    meal_cost = await db.meal_cost_cents()
     meals = await db.count_meals()
     recent = await db.recent_meals(limit=5)
-    await update.message.reply_text(render_stats(spend, meals, CURRENCY, recent))
+    await update.message.reply_text(render_stats(spend, meals, meal_cost, CURRENCY, recent))
 
 
 @owner_only

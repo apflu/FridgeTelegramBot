@@ -377,3 +377,14 @@ class Database:
         ) as cur:
             row = await cur.fetchone()
         return row[0] if row else 0
+
+    async def meal_cost_cents(self, start: date | None = None, end: date | None = None) -> int:
+        """餐食成本：所吃食材的价格快照之和（与 purchases 解耦）。区间按 eaten_date 过滤。"""
+        where, params = self._date_range_clause("m.eaten_date", start, end)
+        async with self._c.execute(
+            "SELECT COALESCE(SUM(mi.price_cents), 0) FROM meal_items mi "
+            f"JOIN meals m ON m.id = mi.meal_id{where}",
+            params,
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else 0
