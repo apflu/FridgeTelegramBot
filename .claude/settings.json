@@ -1,7 +1,8 @@
 {
   "env": {
     "PYTHONIOENCODING": "utf-8",
-    "PYTHONUTF8": "1"
+    "PYTHONUTF8": "1",
+    "CLAUDE_CODE_USE_POWERSHELL_TOOL": "1"
   },
   "permissions": {
     "allow": [
